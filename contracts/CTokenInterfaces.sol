@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 pragma solidity ^0.8.10;
 
+import "./ComptrollerInterface.sol";
+import "./InterestRateModel.sol";
+import "./EIP20NonStandardInterface.sol";
+import "./ErrorReporter.sol";
+
 contract CTokenStorage {
     // Re-entrancy Attack을 방지하기 위해 있는 플래그
     bool internal _notEntered;
@@ -71,5 +76,109 @@ contract CTokenStorage {
 abstract contract CTokenInterface is CTokenStorage {
     bool public constant isCToken = true;
 
+    // 새로 이자율을 갱신했을 때 발생하는 이벤트
     event AccrueInterest(uint cashPrior, uint interestAccumulated, uint borrowIndex, uint totalBorrows);
+
+    // mint를 수행했을 때 발생하는 이벤트
+    event Mint(address minter, uint mintAmount, uint mintTokens);
+
+    // redeem으로 상환을 수행했을 때 발생하는 이벤트
+    event Redeem(address redeemer, uint redeemAmount, uint redeemTokens);
+    event Borrow(address borrower, uint borrowAmount, uint accountBorrows, uint totalBorrows);
+    event RepayBorrow(address payer, address borrower, uint repayAmount, uint accountBorrows, uint totalBorrows);
+    event LiquidateBorrow(address liquidator, address borrower, uint repayAmount, address cTokenCollateral, uint seizeTokens);
+    
+
+    // admin events
+    event NewPendingAdmin(address oldPendingAdmin, address newPendingAdmin);
+    event NewAdmin(address, oldAdmin, address newAdmin);
+    event NewComptroller(ComptrollerInterface oldComptroller, ComptrollerInterface newComptroller);
+    event NewMarketInterestRateModel(InterestRateModel oldInterestRateModel, InterestRateModel newInterestRateModel);
+    event NewReserveFactor(uint oldReserveFactorMantissa, uint newReserveFactorMantissa);
+    event ReservesAdded(address benefactor, uint addAmount, uint newTotalReserves);
+    event ReservesReduced(address admin, uint reduceAmount, uint newTotalReserves);
+    event Transfer(address indexed from, address indexed to, uint amount);
+    event Approval(address indexed owner, address indexed spender, uint amount);
+
+    function transfer(address dst, uint amount) virtual external returns (bool);
+    function transferFrom(address src, address dst, uint amount) virtual external returns (bool);
+    function approve(address spender, uint amount) virtual external returns (bool);
+    function allowance(address owner, address spender) virtual external view returns (uint);
+    function balanceOf(address owner) virtual external view returns (uint);
+    function balanceOfUnderlying(address owner) virtual external returns (uint);
+    function getAccountSnapshot(address account) virtual external view returns (uint, uint, uint, uint);
+    function borrowRatePerBlock() virtual external view returns (uint);
+    function supplyRatePerBlock() virtual external view returns (uint);
+    function totalBorrowsCurrent() virtual external returns (uint);
+    function borrowBalanceCurrent(address account) virtual external returns (uint);
+    function borrowBalanceStored(address account) virtual external view returns (uint);
+    function exchangeRateCurrent() virtual external returns (uint);
+    function exchangeRateStored() virtual external view returns (uint);
+    function getCash() virtual external view returns (uint);
+    function accrueInterest() virtual external returns (uint);
+    function seize(address liquidator, address borrower, uint seizeTokens) virtual external returns (uint);
+
+
+    /*** Admin Functions ***/
+
+    function _setPendingAdmin(address payable newPendingAdmin) virtual external returns (uint);
+    function _acceptAdmin() virtual external returns (uint);
+    function _setComptroller(ComptrollerInterface newComptroller) virtual external returns (uint);
+    function _setReserveFactor(uint newReserveFactorMantissa) virtual external returns (uint);
+    function _reduceReserves(uint reduceAmount) virtual external returns (uint);
+    function _setInterestRateModel(InterestRateModel newInterestRateModel) virtual external returns (uint);
+}
+
+contract CErc20Storage {
+    address public underlying;
+}
+
+abstract contract CErc20Interface is CErc20Storage {
+    /*** User Interface ***/
+
+    function mint(uint mintAmount) virtual external returns (uint);
+    function redeem(uint redeemTokens) virtual external returns (uint);
+    function redeemUnderlying(uint redeemAmount) virtual external returns (uint);
+    function borrow(uint borrowAmount) virtual external returns (uint);
+    function repayBorrow(uint repayAmount) virtual external returns (uint);
+    function repayBorrowBehalf(address borrower, uint repayAmount) virtual external returns (uint);
+    function liquidateBorrow(address borrower, uint repayAmount, CTokenInterface cTokenCollateral) virtual external returns (uint);
+    function sweepToken(EIP20NonStandardInterface token) virtual external;
+
+
+    /*** Admin Functions ***/
+    function _addReserves(uint addAmount) virtual external returns (uint);
+}
+
+contract CDelegationStorage {
+    address public implementation;
+}
+
+abstract contract CDelegatorInterface is CDelegationStorage {
+    /**
+     * @notice Emitted when implementation is changed
+     */
+    event NewImplementation(address oldImplementation, address newImplementation);
+
+    /**
+     * @notice Called by the admin to update the implementation of the delegator
+     * @param implementation_ The address of the new implementation for delegation
+     * @param allowResign Flag to indicate whether to call _resignImplementation on the old implementation
+     * @param becomeImplementationData The encoded bytes data to be passed to _becomeImplementation
+     */
+    function _setImplementation(address implementation_, bool allowResign, bytes memory becomeImplementationData) virtual external;
+}
+
+abstract contract CDelegateInterface is CDelegationStorage {
+    /**
+     * @notice Called by the delegator on a delegate to initialize it for duty
+     * @dev Should revert if any issues arise which make it unfit for delegation
+     * @param data The encoded bytes data for any initialization
+     */
+    function _becomeImplementation(bytes memory data) virtual external;
+
+    /**
+     * @notice Called by the delegator on a delegate to forfeit its responsibility
+     */
+    function _resignImplementation() virtual external;
 }
