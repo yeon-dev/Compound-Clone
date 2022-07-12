@@ -136,16 +136,17 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         return block.number;
     }
 
-    function borrowRatePerBlock() {
-
+    function borrowRatePerBlock() override external view returns (uint) {
+        return interestRateModel.getBorrowRate(getCashPrior(), totalBorrows, totalReserves);
     }
 
-    function supplyRatePerBlock() {
-
+    function supplyRatePerBlock() override external view returns (uint) {
+        return interestRateModel.getSupplyRate(getCashPrior(), totalBorrows, totalReserves, reserveFactorMantissa);
     }
 
-    function totalBorrowsCurrent() {
-
+    function totalBorrowsCurrent() override external nonReentrant returns (uint) {
+        accrueInterest();
+        return totalBorrows;
     }
 
     function borrowBalanceCurrent(address account) override external nonReentrant returns (uint) {
@@ -397,29 +398,108 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         return actualRepayAmount;
     }
 
-    function liquidateBorrowInternal() {
+    // 해당 함수부터는 청산을 위한 함수
+    function liquidateBorrowInternal(address borrower, uint repayAmount, CTokenInterface cTokenCollateral) internal nonReentrant {
+        accrueInterest();
 
+        // 현재 cToken과 담보가 되는 담보 대상 토큰에 대한 이자율을 갱신함
+        uint error = cTokenCollateral.accrueInterest();
+        if (error != NO_ERROR) {
+            revert LiquidateAccrueCollateralInterestFailed(error);
+        }
+
+        // Fresh 함수가 별도로 구현되어 있음
+        liquidateBorrowFresh(msg.sender, borrower, repayAmount, cTokenCollateral);
     }
 
-    function liquidateBorrowFresh() {
+    function liquidateBorrowFresh(address liquidator, address borrower, uint repayAmount, CTokenInterface cTokenCollateral) internal {
+        // 청산에 대한 allow를 확인해야함, comptroller 역할
 
+        if (accrualBlockNumber != getBlockNumber()) {
+            revert LiquidateFreshnessCheck();
+        }
+
+        if (cTokenCollateral.accrualBlockNumber() != getBlockNumber()) {
+            revert LiquidateCollateralFreshnessCheck();
+        }
+
+        if (borrower == liquidator) {
+            // 청산자는 자기자신에 대한 대출을 청산할 수 없음
+            revert LiquidateLiquidatorIsBorrower();
+        }
+
+        if (repayAmount == 0) {
+            // 청산할 값이 없음
+            revert LiquidateCloseAmountIsZero();
+        }
+
+        // Underflow, Overflow 방지
+        if (repayAmount == type(uint).max) {
+            revert LiquidateCloseAmountIsUintMax();
+        }
+
+        // 내부적으로 seize를 기반으로 만들어지는데, comptroller가 압류 토큰의 양을 계산해야함
+        // 차후에 구현
+        // (uint amountSeizeError, uint seizeTokens) = comptroller.liquidateCalculateSeizeTokens()
     }
 
-    function seize() {
-
+    // 해당 함수부터는 압류를 위한 함수
+    function seize(address liquidator, address borrower, uint seizeTokens) override external nonReentrant returns(uint) {
+        seizeInternal(msg.sender, liquidator, borrower, seizeTokens);
+        return NO_ERROR;
     }
 
-    function seizeInternal() {
+    function seizeInternal(address seizerToken, address liquidator, address borrower, uint seizeTokens) internal {
+        // seize operation이 allow되는지 확인, comptroller 역할
 
+        if (borrower == liquidator) {
+            revert LiquidateSeizeLiquidatorIsBorrower();
+        }
+
+        uint protocolSeizeTokens = mul_(seizeTokens, Exp({mantissa: protocolSeizeShareMantissa}));
+        uint liquidatorSeizeTokens = seizeTokens - protocolSeizeTokens;
+        Exp memory exchangeRate = Exp({mantissa: exchangeRateStoredInternal()});
+        uint protocolSeizeAmount = mul_ScalarTruncate(exchangeRate, protocolSeizeTokens);
+        uint totalReservesNew = totalReserves + protocolSeizeAmount;
+
+        totalReserves = totalReservesNew;
+        totalSupply = totalSupply - protocolSeizeTokens;
+        accountTokens[borrower] = accountTokens[borrower] - seizeTokens;
+        accountTokens[liquidator] = accountTokens[liquidator] + liquidatorSeizeTokens;
+
+        emit Transfer(borrower, liquidator, liquidatorSeizeTokens);
+        emit Transfer(borrower, address(this), protocolSeizeTokens);
+        emit ReservesAdded(address(this), protocolSeizeAmount, totalReservesNew);
     }
 
     // Admin Functions
 
-    function _setPendingAdmin() {
+    function _setPendingAdmin() override external returns (uint) {
+        if (msg.sender != admin) {
+            revert SetPendingAdminOwnerCheck();
+        }
 
+        address oldPendingAdmin = pendingAdmin;
+        pendingAdmin = newPendingAdmin;
+        emit NewPedingAdmin(oldPendingAdmin, newPendingAdmin);
+        return NO_ERROR;
     }
 
-    function _acceptAdmin() {
+    function _acceptAdmin() override external returns (uint) {
+        if (msg.sender != pendingAdmin || msg.sender == address(0)) {
+            revert AcceptAdminPendingAdminCheck();
+        }
+
+        address oldAdmin = admin;
+        address oldPendingAdmin = pendingAdmin;
+
+        admin = pendingAdmin;
+
+        // pendingAdmin을 address(0)으로 지정함으로 이후에 다시 이 함수를 사용할 수 있도록 변경
+        pendingAdmin = payable(address(0));
+        emit NewAdmin(oldAdmnin, admin);
+        emit NewPendingAdmin(oldPendingAdmin, pendingAdmin);
+        return NO_ERROR;
 
     }
 
@@ -438,28 +518,90 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         return NO_ERROR;
     }
 
-    function _setReserveFactor() {
-
+    function _setReserveFactor(uint newReserveFactorMantissa) override external nonReentrant returns (uint) {
+        accrueInterest();
+        return _setReserveFactorFresh(newReserveFactorMantissa);
     }
 
-    function _setReserveFactorFresh() {
+    function _setReserveFactorFresh(uint newReserveFactorMantissa) internal returns (uint) {
+        if (msg.sender != admin) {
+            revert SetReserveFactorAdminCheck();
+        }
 
+        if (accrualblockNumber != getBlockNumber()) {
+            revert SetReserveFactorFreshCheck();
+        }
+
+        if (newReserveFactorMantissa > reserveFactorMaxMantissa) {
+            revert SetReserveFactorBoundsCheck();
+        }
+
+        uint oldReserveFactorMantissa = reserveFactorMantissa;
+        reserveFactorMantissa = newReserveFactorMantissa;
+
+        emit NewReserveFactor(oldReserveFactorMantissa, newReserveFactorMantissa);
+        return NO_ERROR;
     }
 
-    function _addReservesInternal() {
-
+    function _addReservesInternal(uint addAmount) internal nonReentrant returns (uint) {
+        accrueInterest();
+        _addReservesFresh(addAmount);
+        return NO_ERROR;
     }
 
-    function _reduceReserves() {
+    function _addReservesFresh(uint addAmount) internal returns (uint, uint) {
+        uint totalReservesNew;
+        uint actualAddAmount;
 
+        if (accrualBlockNumber != getBlockNumber()) {
+            revert AddReservesFactorFreshCheck(actualAddAmount);
+        }
+
+        actualAddAmount = doTransferIn(msg.sender, addAmount);
+        totalReservesNew = totalReserves + actualAddAmount;
+
+        totalReserves = totalReservesNew;
+
+        emit ReservesAdded(msg.sender, actualAddAmount, totalReservesNew);
+        return (NO_ERROR, actualAddAmount);
     }
 
-    function _reduceReservesFresh() {
-
+    function _reduceReserves(uint reduceAmount) override external nonReentrant returns (uint) {
+        accrueInterest();
+        return _reduceReservesFresh(reduceAmount);
     }
 
-    function _setInterestRateModel() {
+    function _reduceReservesFresh(uint reduceAmount) internal returns (uint) {
+        uint totalReservesNew;
+        
+        if (msg.sender != admin) {
+            revert ReduceReservesAdminCheck();
+        }
 
+        if (accrualBlockNumber != getBlockNumber()) {
+            revert ReduceReservesFreshCheck();
+        }
+
+        if (getCashPrior() < reduceAmount) {
+            revert ReduceReservesCashNotAvailable();
+        }
+
+        if (reduceAmount > totalReserves) {
+            revert ReduceReservesCrashValidation();
+        }
+
+        totalReservesNew = totalReserves - reduceAmount;
+        totalReserves = totalReservesNew;
+
+        // 줄어든 예비토큰은 그만큼 해당 컨트랙트를 관리하고 있는 admin에게 전달함
+        doTransferOut(admin, reduceAmount);
+        emit ReservesReduced(admin, reduceAmount, totalReservesNew);
+        return NO_ERROR;
+    }
+
+    function _setInterestRateModel(InterestRateModel newInterestRateModel) override public returns (uint) {
+        accrueInterest();
+        return _setInterestRateModelFresh(newInterestRateModel);
     }
 
     function _setInterestRateModelFresh(InterestRateModel newInterestRateModel) internal returns (uint) {
