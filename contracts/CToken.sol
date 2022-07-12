@@ -56,6 +56,10 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
 
     // spender은 이 transfer 명령을 수행하는 주체가 되는 실행자
     function transferTokens(address spender, address src, address dst, uint tokens) internal returns (uint) {
+        uint allowed = comptroller.transferAllowed(address(this), src, dst, tokens);
+        if (allowed != 0) {
+            revert TransferComptrollerRejection(allowed);
+        }
         if (src == dst) {
             // source와 destination은 동일할 수 없음
             revert TransferNotAllowed();
@@ -255,6 +259,10 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
 
     function mintFresh(address minter, uint mintAmount) internal {
         // Allowed 코드 필요
+        uint allowed = comptroller.mintAllowed(address(this), minter, mintAmount);
+        if (allowed != 0) {
+            revert MintComptrollerRejection(allowed);
+        }
 
         if (accrualBlockNumber != getBlockNumber()) {
             revert MintFreshnessCheck();
@@ -312,6 +320,11 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
             redeemAmount = redeemAmountIn;
         }
 
+
+        uint allowed = comptroller.redeemAllowed(address(this), redeemer, redeemTokens);
+        if (allowed != 0) {
+            revert RedeemComptrollerRejection(allowed);
+        }
         // allowed check 필요, from comptroller
         if (accrualBlockNumber != getBlockNumber()) {
             revert RedeemFreshnessCheck();
@@ -341,6 +354,11 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
 
     function borrowFresh(address payable borrower, uint borrowAmount) internal {
         // allowed 함수 필요
+
+        uint allowed = comptroller.borrowAllowed(address(this), borrower, borrowAmount);
+        if (allowed != 0) {
+            revert BorrowComptrollerRejection(allowed);
+        }
 
         // 이 기능을 통해서 Front-running attack을 방지할 수 있음
         if (accrualBlockNumber != getBlockNumber()) {
@@ -377,6 +395,10 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
 
     function repayBorrowFresh(address payer, address borrower, uint repayAmount) internal returns (uint) {
         // allow 코드 필요
+        uint allowed = comptroller.repayBorrowAllowed(address(this), payer, borrower, repayAmount);
+        if (allowed != 0) {
+            revert RepayBorrowComptrollerRejection(allowed);
+        }
 
         if (accrualBlockNumber != getBlockNumber()) {
             revert RepayBorrowFreshnessCheck();
@@ -415,6 +437,11 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
     function liquidateBorrowFresh(address liquidator, address borrower, uint repayAmount, CTokenInterface cTokenCollateral) internal {
         // 청산에 대한 allow를 확인해야함, comptroller 역할
 
+        uint allowed = comptroller.liquidateBorrowAllowed(address(this), address(cTokenCollateral), liquidator, borrower, repayAmount);
+        if (allowed != 0) {
+            revert LiquidateComptrollerRejection(allowed);
+        }
+
         if (accrualBlockNumber != getBlockNumber()) {
             revert LiquidateFreshnessCheck();
         }
@@ -451,6 +478,11 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
 
     function seizeInternal(address seizerToken, address liquidator, address borrower, uint seizeTokens) internal {
         // seize operation이 allow되는지 확인, comptroller 역할
+
+        uint allowed = comptroller.seizeAllowed(address(this), seizerToken, liquidator, borrower, seizeTokens);
+        if (allowed != 0) {
+            revert LiquidateSeizeComptrollerRejection(allowed);
+        }
 
         if (borrower == liquidator) {
             revert LiquidateSeizeLiquidatorIsBorrower();
