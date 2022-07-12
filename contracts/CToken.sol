@@ -123,8 +123,13 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         return mul_ScalarTruncate(exchangeRate, accountTokens[owner]);
     }
 
-    function getAccountSnapshot() {
-
+    function getAccountSnapshot(address account) override external view returns (uint, uint, uint, uint) {
+        return (
+            NO_ERROR,
+            accountTokens[account],
+            borrowBalanceStoredInternal(account),
+            exchangeRateStoredInternal()
+        );
     }
 
     function getBlockNumber() virtual internal view returns (uint) {
@@ -143,16 +148,24 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
 
     }
 
-    function borrowBalanceCurrent() {
-
+    function borrowBalanceCurrent(address account) override external nonReentrant returns (uint) {
+        accrueInterest();
+        return borrowBalanceStored(account);
     }
 
-    function borrowBalanceStored() {
-
+    function borrowBalanceStored(address account) override public view returns (uint) {
+        return borrowBalanceStoredInternal(account);
     }
 
-    function borrowBalanceStoredInternal() {
+    function borrowBalanceStoredInternal(address account) internal view returns (uint) {
+        BorrowSnapshot storage borrowSnapshot = accountBorrows[account];
 
+        if (borrowSnapshot.principal == 0) {
+            return 0;
+        }
+
+        uint principalTimesIndex = borrowSnapshot.principal * borrowIndex;
+        return principalTimesIndex / borrowSnapshot.interestIndex;
     }
 
     // 굳이 nonReentrant가 붙은 이유?
@@ -234,24 +247,90 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         return NO_ERROR;
     }
 
-    function mintInternal() {
-
+    function mintInternal(uint mintAmount) internal nonReentrant {
+        accrueInterest();
+        mintFresh(msg.sender, mintAmount);
     }
 
-    function mintFresh() {
+    function mintFresh(address minter, uint mintAmount) internal {
+        // Allowed 코드 필요
 
+        if (accrualBlockNumber != getBlockNumber()) {
+            revert MintFreshnessCheck();
+        }
+
+        Exp memory exchangeRate = Exp({mantissa: exchangeRateStoredInternal()});
+        // 현재 mint되는 토큰에 대한 총량을 계산함
+        // doTransferIn의 경우 CErc20과 CEther의 구현부가 서로 다름
+        // CEther은 amount만큼을 되돌리기 때문에 그냥 mintAmount가 actualMintAmount가 됨
+        // 반면에 CErc20의 경우 transferFrom을 직접 수행함
+        // 근데 이렇게 되면 실제로 보유한 토큰량에 변화가 생길텐데 상관이 없나 생각중
+        uint actualMintAmount = doTransferIn(minter, mintAmount);
+
+        // 환율로 실제 mint되는 양을 나눔으로 이 mint되는 양이 토큰으로는 얼마만큼인지를 계산함
+        uint mintTokens = div_(actualMintAmount, exchangeRate);
+
+        totalSupply = totalSupply + mintTokens;
+        accountTokens[minter] = accountTokens[minter] + mintTokens;
+
+        emit Mint(minter, actualMintAmount, mintTokens);
+        emit Transfer(address(this), minter, mintTokens);
     }
 
-    function redeemInternal() {
-
+    function redeemInternal(uint redeemTokens) internal nonReentrant {
+        // accrueInterest()가 실행이 되는 이유는 이러한 상환, 대출 및 청산 등의 함수를 실행하기에 앞서
+        // 이자율을 업데이트 할 필요가 있기 때문
+        accrueInterest();
+        redeemFresh(payable(msg.sender), redeemTokens, 0);
     }
 
-    function redeemUnderlyingInternal() {
-
+    // 기능상 redeemInternal() 함수와 반대되는 방식으로 상환
+    function redeemUnderlyingInternal(uint redeemAmount) internal nonReentrant {
+        accrueInterest();
+        redeemFresh(payable(msg.sender), 0, redeemAmount);
     }
 
-    function redeemFresh() {
+    // redeemTokensIn의 경우 하위 컨트랙트에 상환할 cToken의 수
+    // redeemAmountIn의 경우 상환하는 cToken으로부터 계산할 수 있는 Amount
+    function redeemFresh(address payable redeemer, uint redeemTokensIn, uint redeemAmountIn) internal {
+        require(redeemTokensIn == 0 || redeemAmountIn == 0, "one of redeemTokensIn or redeemAmountIn must be zero");
 
+        // 현재 환율을 계산
+        Exp memory exchangeRate = Exp({mantissa: exchangeRateStoredInternal()});
+
+        uint redeemTokens;
+        uint redeemAmount;
+
+        // 이 경우 하위 컨트랙트에 cToken을 상환하려는 경우
+        if (redeemTokensIn > 0) {
+            redeemTokens = redeemTokensIn;
+            redeemAmount = mul_ScalarTruncate(exchangeRate, redeemTokensIn);
+        } else {
+            // 이게 아닌 경우에는 redeemAmountIn이 제공된 경우로, 토큰이 아니라 Amount가 기준이 된 경우를 의미
+            redeemTokens = div_(redeemAmountIn, exchangeRate);
+            redeemAmount = redeemAmountIn;
+        }
+
+        // allowed check 필요, from comptroller
+        if (accrualBlockNumber != getBlockNumber()) {
+            revert RedeemFreshnessCheck();
+        }
+
+        // 현재 보유한 캐쉬 잔액이 상환하고자 하는 토큰의 가치보다 적을 경우엔 상환이 불가능
+        if (getCashPrior() < redeemAmount) {
+            revert RedeemTransferOutNotPossible();
+        }
+
+        totalSupply = totalSupply - redeemTokens;
+        accountTokens[redeemer] = accountTokens[redeemer] - redeemTokens;
+
+        // 실제 가치를 계산해서 Ether로 전달
+        doTransferOut(redeemer, redeemAmount);
+
+        emit Transfer(redeemer, address(this), redeemTokens);
+        emit Redeem(redeemer, redeemAmount, redeemTokens);
+
+        // comptroller의 redeemVerify가 필요
     }
 
     function borrowInternal() {
