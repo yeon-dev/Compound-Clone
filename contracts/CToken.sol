@@ -333,24 +333,68 @@ abstract contract CToken is CTokenInterface, ExponentialNoError, TokenErrorRepor
         // comptroller의 redeemVerify가 필요
     }
 
-    function borrowInternal() {
-
+    function borrowInternal(uint borrowAmount) internal nonReentrant {
+        accrueInterest();
+        borrowFresh(payable(msg.sender), borrowAmount);
     }
 
-    function borrowFresh() {
+    function borrowFresh(address payable borrower, uint borrowAmount) internal {
+        // allowed 함수 필요
 
+        // 이 기능을 통해서 Front-running attack을 방지할 수 있음
+        if (accrualBlockNumber != getBlockNumber()) {
+            revert BorrowFreshnessCheck();
+        }
+
+        if (getCashPrior() < borrowAmount) {
+            // 대출을 원하는 양이 컨트랙트가 보유한 캐쉬의 양보다 많을 경우 에러
+            revert BorrowCrashNotAvailable();
+        }
+
+        uint accountBorrowsPrev = borrowBalanceStoredInternal(borrower);
+        uint accountBorrowsNew = accountBorrowsPrev + borrowAmount;
+        uint totalBorrowsNew = totalBorrows + borrowAmount;
+
+        accountBorrows[borrower].principal = accountBorrowsNew;
+        accountBorrows[borrower].interestIndex = borrowIndex;
+        totalBorrows = totalBorrowsNew;
+
+        doTransferOut(borrower, borrowAmount);
+        emit Borrow(borrower, borrowAmount, accountBorrowsNew, totalBorrowsNew);
     }
 
-    function repayBorrowInternal() {
-
+    function repayBorrowInternal(uint repayAmount) internal nonReentrant {
+        accrueInterest();
+        repayBorrowFresh(msg.sender, msg.sender, repayAmount);
     }
 
-    function repayBorrowBehalfInternal() {
-
+    // 이 함수를 통해 다른 사람이 대신 대출금을 갚아줄 수 있음
+    function repayBorrowBehalfInternal(address borrower, uint repayAmount) internal nonReentrant {
+        accrueInterest();
+        repayBorrowFresh(msg.sender, borrower, repayAmount);
     }
 
-    function repayBorrowFresh() {
+    function repayBorrowFresh(address payer, address borrower, uint repayAmount) internal returns (uint) {
+        // allow 코드 필요
 
+        if (accrualBlockNumber != getBlockNumber()) {
+            revert RepayBorrowFreshnessCheck();
+        }
+
+        uint accountBorrowsPrev = borrowBalanceStoredInternal(borrower);
+        // 만약 repayAmount가 type(uint).max 만큼 제공되면 이건 전체를 전부 갚겠다는 의미로 해석
+        uint repayAmountFinal = repayAmount == type(uint).max ? accountBorrowsPrev : repayAmount;
+
+        uint actualRepayAmount = doTransferIn(payer, repayAmountFinal);
+        uint accountBorrowsNew = accountBorrowsPrev - actualRepayAmount;
+        uint totalBorrowsNew = totalBorrows - actualRepayAmount;
+
+        accountBorrows[borrower].principal = accountBorrowsNew;
+        accountBorrows[borrower].interestIndex = borrowIndex;           // borrowIndex는 매번 갱신되나?
+        totalBorrows = totalBorrowsNew;
+
+        emit RepayBorrow(payer, borrower, actualRepayAmount, accountBorrowsNew, totalBorrowsNew);
+        return actualRepayAmount;
     }
 
     function liquidateBorrowInternal() {
